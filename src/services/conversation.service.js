@@ -1,0 +1,643 @@
+/**
+ * ConversationService — private & group conversations.
+ *
+ * Design notes:
+ *   - Private DMs are idempotent (unique `privateKey`).
+ *   - Participant state (pin/archive/mute/unread) is per-user.
+ *   - Authorization: participant to view; admin/owner to modify group.
+ *   - "Deleted for me" / "left" conversations behave as 404 to the leaver.
+ */
+
+'use strict';
+
+const mongoose = require('mongoose');
+const { Conversation, User } = require('../models');
+const {
+    BadRequestError,
+    NotFoundError,
+    ForbiddenError,
+    ConflictError,
+} = require('../utils/exceptions');
+const { publicProfile } = require('./user.service');
+const { UserService } = require('./user.service');
+const { participantId } = require('../utils/helpers/conversation');
+const {
+    CONVERSATION_TYPE,
+    PARTICIPANT_ROLE,
+} = require('../config/constants');
+const { broadcast } = require('../sockets');
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function isValidId(id) {
+    return mongoose.Types.ObjectId.isValid(id);
+}
+
+function assertValidId(id, label = 'Conversation') {
+    if (!isValidId(id)) throw new BadRequestError(`Invalid ${label} ID`, 'INVALID_ID');
+}
+
+/**
+ * Standard conversation serializer.
+ * @param {Document|Object} conv — Mongoose doc or lean object
+ * @param {string|ObjectId} viewerId — who's asking (for `myFlags`)
+ */
+function serializeConversation(conv, viewerId) {
+    if (!conv) return null;
+    const viewerStr = viewerId ? viewerId.toString() : null;
+
+    const me = viewerStr
+        ? conv.participants.find((p) => {
+            const pid = participantId(p);
+            return pid && pid.toString() === viewerStr;
+        })
+        : null;
+
+    // Only show active participants
+    const activeParticipants = conv.participants.filter((p) => !p.leftAt);
+
+    const sortedParticipants = [...activeParticipants].sort((a, b) => {
+        const rank = { owner: 0, admin: 1, member: 2 };
+        const ra = rank[a.role] ?? 3;
+        const rb = rank[b.role] ?? 3;
+        if (ra !== rb) return ra - rb;
+        return new Date(a.joinedAt) - new Date(b.joinedAt);
+    });
+
+    return {
+        id: conv._id.toString(),
+        type: conv.type,
+        group: conv.type === CONVERSATION_TYPE.GROUP
+            ? {
+                name: conv.group?.name || null,
+                description: conv.group?.description || '',
+                avatar: conv.group?.avatar || { url: null, publicId: null },
+            }
+            : null,
+        participants: sortedParticipants.map((p) => {
+            const populatedUser = p.userId && p.userId._id ? p.userId : null;
+            const pid = participantId(p);
+            return {
+                user: populatedUser
+                    ? publicProfile(populatedUser)
+                    : { id: pid ? pid.toString() : null },
+                role: p.role,
+                joinedAt: p.joinedAt,
+            };
+        }),
+        lastMessage:
+            conv.lastMessage && conv.lastMessage.messageId
+                ? {
+                    messageId: conv.lastMessage.messageId.toString(),
+                    content: conv.lastMessage.content,
+                    senderId: conv.lastMessage.senderId
+                        ? conv.lastMessage.senderId._id
+                            ? conv.lastMessage.senderId._id.toString()
+                            : conv.lastMessage.senderId.toString()
+                        : null,
+                    type: conv.lastMessage.type,
+                    createdAt: conv.lastMessage.createdAt,
+                }
+                : null,
+        myFlags: me
+            ? {
+                pinned: !!me.pinned,
+                archived: !!me.archived,
+                muted: !!me.muted,
+                mutedUntil: me.mutedUntil || null,
+                unreadCount: me.unreadCount || 0,
+                lastReadAt: me.lastReadAt || null,
+                deleted: !!me.deleted,
+            }
+            : null,
+        createdAt: conv.createdAt,
+        updatedAt: conv.updatedAt,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Service
+// ---------------------------------------------------------------------------
+
+class ConversationService {
+    // -----------------------------------------------------------------------
+    // Create
+    // -----------------------------------------------------------------------
+
+    static async create(userId, payload) {
+        if (payload.type === CONVERSATION_TYPE.PRIVATE) {
+            return this._createPrivate(userId, payload);
+        }
+        return this._createGroup(userId, payload);
+    }
+
+    static async _createPrivate(userId, { recipientId }) {
+        assertValidId(recipientId, 'Recipient');
+
+        if (recipientId.toString() === userId.toString()) {
+            throw new BadRequestError(
+                'Cannot create a conversation with yourself',
+                'SELF_CONVERSATION'
+            );
+        }
+
+        const [me, recipient] = await Promise.all([
+            User.findById(userId),
+            User.findById(recipientId),
+        ]);
+
+        if (!me) throw new NotFoundError('User not found', 'USER_NOT_FOUND');
+        if (!recipient) throw new NotFoundError('Recipient not found', 'RECIPIENT_NOT_FOUND');
+
+        // Block check — either direction
+        const mutual = await UserService.isMutuallyBlocked(userId, recipientId);
+        if (mutual) throw new ForbiddenError('Cannot message this user', 'USER_BLOCKED');
+
+        // Try to find existing DM
+        const existing = await Conversation.findPrivate(userId, recipientId);
+        if (existing) {
+            // If the DM was "deleted for me", restore it for me on new creation attempt
+            const meParticipant = existing.getParticipant(userId);
+            if (meParticipant && meParticipant.deleted) {
+                meParticipant.deleted = false;
+                meParticipant.deletedAt = null;
+                meParticipant.unreadCount = 0;
+                await existing.save();
+            }
+            await existing.populate([
+                {
+                    path: 'participants.userId',
+                    select: 'name username avatar status lastSeen settings',
+                },
+                { path: 'lastMessage.senderId', select: 'name username avatar' },
+            ]);
+            return serializeConversation(existing, userId);
+        }
+
+        // Create new
+        const conv = await Conversation.create({
+            type: CONVERSATION_TYPE.PRIVATE,
+            participants: [
+                { userId: me._id, role: PARTICIPANT_ROLE.OWNER, joinedAt: new Date() },
+                { userId: recipient._id, role: PARTICIPANT_ROLE.MEMBER, joinedAt: new Date() },
+            ],
+            createdBy: me._id,
+        });
+
+        await conv.populate([
+            {
+                path: 'participants.userId',
+                select: 'name username avatar status lastSeen settings',
+            },
+            { path: 'lastMessage.senderId', select: 'name username avatar' },
+        ]);
+
+        const participantIds = conv.participants
+            .map((p) => (p.userId._id ? p.userId._id.toString() : p.userId.toString()));
+
+        broadcast.conversationNew({
+            participantIds,
+            conversation: serializeConversation(conv, userId),
+        });
+
+        return serializeConversation(conv, userId);
+    }
+
+    static async _createGroup(userId, { name, description, participants, avatar }) {
+        const userIdStr = userId.toString();
+        const uniqueIds = Array.from(
+            new Set(participants.map((p) => p.toString()).filter((id) => id !== userIdStr))
+        );
+
+        if (uniqueIds.length === 0) {
+            throw new BadRequestError(
+                'A group requires at least one other participant',
+                'NO_PARTICIPANTS'
+            );
+        }
+
+        const users = await User.find({ _id: { $in: uniqueIds } }).select('_id');
+        if (users.length !== uniqueIds.length) {
+            const found = new Set(users.map((u) => u._id.toString()));
+            const missing = uniqueIds.filter((id) => !found.has(id));
+            throw new NotFoundError(
+                `Some participants were not found: ${missing.join(', ')}`,
+                'PARTICIPANTS_NOT_FOUND'
+            );
+        }
+
+        const conv = await Conversation.create({
+            type: CONVERSATION_TYPE.GROUP,
+            group: {
+                name: name.trim(),
+                description: (description || '').trim(),
+                avatar: avatar || { url: null, publicId: null },
+            },
+            participants: [
+                {
+                    userId: new mongoose.Types.ObjectId(userIdStr),
+                    role: PARTICIPANT_ROLE.OWNER,
+                    joinedAt: new Date(),
+                },
+                ...uniqueIds.map((id) => ({
+                    userId: new mongoose.Types.ObjectId(id),
+                    role: PARTICIPANT_ROLE.MEMBER,
+                    joinedAt: new Date(),
+                })),
+            ],
+            createdBy: new mongoose.Types.ObjectId(userIdStr),
+        });
+
+        await conv.populate([
+            {
+                path: 'participants.userId',
+                select: 'name username avatar status lastSeen settings',
+            },
+            { path: 'lastMessage.senderId', select: 'name username avatar' },
+        ]);
+
+        const participantIds = conv.participants
+            .map((p) => (p.userId._id ? p.userId._id.toString() : p.userId.toString()));
+
+        broadcast.conversationNew({
+            participantIds,
+            conversation: serializeConversation(conv, userId),
+        });
+
+        return serializeConversation(conv, userId);
+    }
+
+    // -----------------------------------------------------------------------
+    // Read
+    // -----------------------------------------------------------------------
+
+    static async getById(userId, conversationId) {
+        assertValidId(conversationId);
+        const conv = await Conversation.findById(conversationId)
+            .populate('participants.userId', 'name username avatar status lastSeen settings')
+            .populate('lastMessage.senderId', 'name username avatar');
+
+        if (!conv) throw new NotFoundError('Conversation not found', 'CONVERSATION_NOT_FOUND');
+
+        // Two-step authorization:
+        //   1. Find MY participant entry (may be populated or not).
+        //   2. If I have `deleted: true` or `leftAt` set → behave as 404 (privacy).
+        //   3. If I was never a participant → 403.
+        const me = conv.getParticipant(userId);
+        if (me && (me.deleted || me.leftAt)) {
+            throw new NotFoundError('Conversation not found', 'CONVERSATION_NOT_FOUND');
+        }
+        if (!conv.isParticipant(userId)) {
+            throw new ForbiddenError('You are not a participant', 'NOT_PARTICIPANT');
+        }
+
+        return serializeConversation(conv, userId);
+    }
+
+    static async list(userId, { archived = false, pinned, limit = 30, before = null } = {}) {
+        const l = Math.min(Math.max(parseInt(limit, 10) || 30, 1), 100);
+
+        const query = {
+            'participants.userId': userId,
+            'participants.deleted': { $ne: true },
+        };
+
+        if (archived) {
+            query.participants = {
+                $elemMatch: { userId, deleted: { $ne: true }, archived: true },
+            };
+        } else {
+            query.participants = {
+                $elemMatch: { userId, deleted: { $ne: true }, archived: { $ne: true } },
+            };
+        }
+
+        if (pinned === true) {
+            query.$and = [{ participants: { $elemMatch: { userId, pinned: true } } }];
+        }
+
+        if (before) {
+            const beforeDate = new Date(before);
+            if (!isNaN(beforeDate.getTime())) {
+                query.updatedAt = { $lt: beforeDate };
+            }
+        }
+
+        const items = await Conversation.find(query)
+            .sort({ updatedAt: -1 })
+            .limit(l)
+            .populate('participants.userId', 'name username avatar status lastSeen settings')
+            .populate('lastMessage.senderId', 'name username avatar');
+
+        const serialized = items.map((c) => serializeConversation(c, userId));
+        const hasMore = items.length === l;
+        const nextCursor = hasMore ? items[items.length - 1].updatedAt.toISOString() : null;
+
+        return {
+            items: serialized,
+            meta: { limit: l, hasMore, nextCursor },
+        };
+    }
+
+    // -----------------------------------------------------------------------
+    // Update group info
+    // -----------------------------------------------------------------------
+
+    static async update(userId, conversationId, updates) {
+        assertValidId(conversationId);
+
+        const conv = await Conversation.findById(conversationId);
+        if (!conv) throw new NotFoundError('Conversation not found', 'CONVERSATION_NOT_FOUND');
+        if (conv.type !== CONVERSATION_TYPE.GROUP) {
+            throw new BadRequestError('Only groups can be updated', 'NOT_A_GROUP');
+        }
+        if (!conv.isParticipant(userId)) {
+            throw new ForbiddenError('You are not a participant', 'NOT_PARTICIPANT');
+        }
+        if (!conv.isAdmin(userId)) {
+            throw new ForbiddenError('Only admins can update group info', 'NOT_ADMIN');
+        }
+
+        if (updates.name !== undefined) conv.group.name = updates.name.trim();
+        if (updates.description !== undefined) conv.group.description = updates.description.trim();
+        if (updates.avatar !== undefined) {
+            conv.group.avatar = {
+                url: updates.avatar.url ?? null,
+                publicId: updates.avatar.publicId ?? null,
+            };
+        }
+
+        await conv.save();
+        await conv.populate([
+            { path: 'participants.userId', select: 'name username avatar status lastSeen settings' },
+            { path: 'lastMessage.senderId', select: 'name username avatar' },
+        ]);
+
+        return serializeConversation(conv, userId);
+    }
+
+    // -----------------------------------------------------------------------
+    // Members
+    // -----------------------------------------------------------------------
+
+    static async addMember(userId, conversationId, newMemberId) {
+        assertValidId(conversationId);
+        assertValidId(newMemberId, 'User');
+
+        const conv = await Conversation.findById(conversationId);
+        if (!conv) throw new NotFoundError('Conversation not found', 'CONVERSATION_NOT_FOUND');
+        if (conv.type !== CONVERSATION_TYPE.GROUP) {
+            throw new BadRequestError('Cannot add members to a private conversation', 'NOT_A_GROUP');
+        }
+        if (!conv.isAdmin(userId)) {
+            throw new ForbiddenError('Only admins can add members', 'NOT_ADMIN');
+        }
+
+        const existing = conv.getParticipant(newMemberId);
+        if (existing && !existing.leftAt && !existing.deleted) {
+            throw new ConflictError('User is already a participant', 'ALREADY_PARTICIPANT');
+        }
+
+        const newUser = await User.findById(newMemberId);
+        if (!newUser) throw new NotFoundError('User not found', 'USER_NOT_FOUND');
+
+        if (existing) {
+            existing.leftAt = null;
+            existing.deleted = false;
+            existing.deletedAt = null;
+            existing.unreadCount = 0;
+            existing.role = PARTICIPANT_ROLE.MEMBER;
+            existing.joinedAt = new Date();
+        } else {
+            conv.participants.push({
+                userId: newUser._id,
+                role: PARTICIPANT_ROLE.MEMBER,
+                joinedAt: new Date(),
+            });
+        }
+
+        await conv.save();
+        await conv.populate('participants.userId', 'name username avatar status lastSeen settings');
+
+        return serializeConversation(conv, userId);
+    }
+
+    static async removeMember(userId, conversationId, targetId) {
+        assertValidId(conversationId);
+        assertValidId(targetId, 'User');
+
+        if (userId.toString() === targetId.toString()) {
+            throw new BadRequestError('Use the leave endpoint to remove yourself', 'USE_LEAVE');
+        }
+
+        const conv = await Conversation.findById(conversationId);
+        if (!conv) throw new NotFoundError('Conversation not found', 'CONVERSATION_NOT_FOUND');
+        if (conv.type !== CONVERSATION_TYPE.GROUP) {
+            throw new BadRequestError(
+                'Cannot remove members from a private conversation',
+                'NOT_A_GROUP'
+            );
+        }
+        if (!conv.isAdmin(userId)) {
+            throw new ForbiddenError('Only admins can remove members', 'NOT_ADMIN');
+        }
+
+        const target = conv.getParticipant(targetId);
+        if (!target || target.leftAt) {
+            throw new NotFoundError('User is not a participant', 'NOT_PARTICIPANT');
+        }
+        if (target.role === PARTICIPANT_ROLE.OWNER) {
+            throw new ForbiddenError('Cannot remove the group owner', 'CANNOT_REMOVE_OWNER');
+        }
+
+        target.leftAt = new Date();
+        await conv.save();
+
+        await conv.populate('participants.userId', 'name username avatar status lastSeen settings');
+        return serializeConversation(conv, userId);
+    }
+
+    static async updateMemberRole(userId, conversationId, targetId, newRole) {
+        assertValidId(conversationId);
+        assertValidId(targetId, 'User');
+
+        if (newRole === PARTICIPANT_ROLE.OWNER) {
+            throw new BadRequestError('Cannot assign owner role directly', 'INVALID_ROLE');
+        }
+
+        const conv = await Conversation.findById(conversationId);
+        if (!conv) throw new NotFoundError('Conversation not found', 'CONVERSATION_NOT_FOUND');
+        if (conv.type !== CONVERSATION_TYPE.GROUP) {
+            throw new BadRequestError('Only groups have roles', 'NOT_A_GROUP');
+        }
+
+        const me = conv.getParticipant(userId);
+        if (!me || me.role !== PARTICIPANT_ROLE.OWNER) {
+            throw new ForbiddenError('Only the owner can change roles', 'NOT_OWNER');
+        }
+
+        const target = conv.getParticipant(targetId);
+        if (!target || target.leftAt) {
+            throw new NotFoundError('User is not a participant', 'NOT_PARTICIPANT');
+        }
+        if (target.role === PARTICIPANT_ROLE.OWNER) {
+            throw new ForbiddenError('Cannot change the owner role', 'CANNOT_CHANGE_OWNER');
+        }
+
+        target.role = newRole;
+        await conv.save();
+
+        await conv.populate('participants.userId', 'name username avatar status lastSeen settings');
+        return serializeConversation(conv, userId);
+    }
+
+    // -----------------------------------------------------------------------
+    // Leave / delete for me
+    // -----------------------------------------------------------------------
+
+    static async leave(userId, conversationId) {
+        assertValidId(conversationId);
+        const conv = await Conversation.findById(conversationId);
+        if (!conv) throw new NotFoundError('Conversation not found', 'CONVERSATION_NOT_FOUND');
+
+        const me = conv.getParticipant(userId);
+        if (!me || me.leftAt) {
+            throw new NotFoundError('You are not a participant', 'NOT_PARTICIPANT');
+        }
+
+        // For groups: if I'm the owner and others remain, transfer ownership
+        if (
+            conv.type === CONVERSATION_TYPE.GROUP &&
+            me.role === PARTICIPANT_ROLE.OWNER
+        ) {
+            const others = conv.participants.filter(
+                (p) => participantId(p).toString() !== userId.toString() && !p.leftAt
+            );
+            if (others.length > 0) {
+                const nextOwner =
+                    others.find((p) => p.role === PARTICIPANT_ROLE.ADMIN) ||
+                    others.sort((a, b) => new Date(a.joinedAt) - new Date(b.joinedAt))[0];
+                nextOwner.role = PARTICIPANT_ROLE.OWNER;
+            }
+        }
+
+        me.leftAt = new Date();
+        me.deleted = true;
+        me.deletedAt = new Date();
+        await conv.save();
+
+        return { left: true };
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-user flags
+    // -----------------------------------------------------------------------
+
+    static async setPinned(userId, conversationId, pinned) {
+        return this._updateMyFlag(userId, conversationId, { pinned: !!pinned });
+    }
+
+    static async setArchived(userId, conversationId, archived) {
+        return this._updateMyFlag(userId, conversationId, { archived: !!archived });
+    }
+
+    static async setMuted(userId, conversationId, muted, mutedUntil = null) {
+        const updates = { muted: !!muted };
+        if (muted) {
+            updates.mutedUntil = mutedUntil ? new Date(mutedUntil) : null;
+        } else {
+            updates.mutedUntil = null;
+        }
+        return this._updateMyFlag(userId, conversationId, updates);
+    }
+
+    static async markRead(userId, conversationId, upToMessageId = null) {
+        assertValidId(conversationId);
+        const conv = await Conversation.findById(conversationId);
+        if (!conv) throw new NotFoundError('Conversation not found', 'CONVERSATION_NOT_FOUND');
+
+        const me = conv.getParticipant(userId);
+        if (!me || me.leftAt) {
+            throw new ForbiddenError('You are not a participant', 'NOT_PARTICIPANT');
+        }
+
+        me.unreadCount = 0;
+        me.lastReadAt = new Date();
+        if (upToMessageId) {
+            assertValidId(upToMessageId, 'Message');
+            me.lastReadMessageId = new mongoose.Types.ObjectId(upToMessageId);
+        }
+        await conv.save();
+
+        return {
+            unreadCount: 0,
+            lastReadAt: me.lastReadAt,
+            lastReadMessageId: me.lastReadMessageId,
+        };
+    }
+
+    static async _updateMyFlag(userId, conversationId, updates) {
+        assertValidId(conversationId);
+        const conv = await Conversation.findById(conversationId);
+        if (!conv) throw new NotFoundError('Conversation not found', 'CONVERSATION_NOT_FOUND');
+
+        const me = conv.getParticipant(userId);
+        if (!me || me.leftAt) {
+            throw new ForbiddenError('You are not a participant', 'NOT_PARTICIPANT');
+        }
+
+        for (const [key, value] of Object.entries(updates)) {
+            me[key] = value;
+        }
+
+        if (
+            me.deleted &&
+            Object.keys(updates).some((k) => k === 'pinned' || k === 'archived' || k === 'muted')
+        ) {
+            me.deleted = false;
+            me.deletedAt = null;
+        }
+
+        await conv.save();
+        await conv.populate('participants.userId', 'name username avatar status lastSeen settings');
+        return serializeConversation(conv, userId);
+    }
+
+    // -----------------------------------------------------------------------
+    // Utilities used by other services
+    // -----------------------------------------------------------------------
+
+    static async requireParticipant(userId, conversationId) {
+        assertValidId(conversationId);
+        const conv = await Conversation.findById(conversationId);
+        if (!conv) throw new NotFoundError('Conversation not found', 'CONVERSATION_NOT_FOUND');
+        if (!conv.isParticipant(userId)) {
+            throw new ForbiddenError('You are not a participant', 'NOT_PARTICIPANT');
+        }
+        return conv;
+    }
+
+    static async incrementUnread(conversationId, senderId) {
+        await Conversation.updateOne(
+            { _id: conversationId },
+            { $inc: { 'participants.$[p].unreadCount': 1 } },
+            {
+                arrayFilters: [
+                    {
+                        'p.userId': { $ne: senderId },
+                        'p.leftAt': null,
+                        'p.deleted': { $ne: true },
+                    },
+                ],
+            }
+        );
+    }
+
+    static async findOrCreatePrivate(userId, recipientId) {
+        return this._createPrivate(userId, { recipientId });
+    }
+}
+
+module.exports = { ConversationService, serializeConversation };

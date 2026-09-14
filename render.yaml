@@ -1,0 +1,62 @@
+services:
+  - type: web
+    name: realtime-chat-api
+    env: node
+    plan: starter
+    region: oregon
+    buildCommand: npm ci --only=production
+    startCommand: node src/server.js
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 5000
+      - key: API_PREFIX
+        value: /api
+      - key: MONGODB_URI
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: REDIS_ENABLED
+        value: 'true'
+      - key: JWT_ACCESS_SECRET
+        generateValue: true
+      - key: JWT_REFRESH_SECRET
+        generateValue: true
+      - key: JWT_ACCESS_EXPIRES_IN
+        value: 15m
+      - key: JWT_REFRESH_EXPIRES_IN
+        value: 7d
+      - key: BCRYPT_SALT_ROUNDS
+        value: '12'
+      - key: CORS_ORIGIN
+        sync: false
+      - key: UPLOAD_PROVIDER
+        value: cloudinary
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
+        sync: false
+      - key: EMAIL_ENABLED
+        value: 'false'
+      - key: LOG_LEVEL
+        value: info
+      - key: SWAGGER_ENABLED
+        value: 'false'
+
+  - type: redis
+    name: realtime-chat-redis
+    plan: starter
+    region: oregon
+    ipAllowList: []
+    maxmemoryPolicy: allkeys-lru
+
+databases:
+  - name: realtime-chat-db
+    databaseName: realtime-chat
+    plan: starter
+    region: oregon
