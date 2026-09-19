@@ -17,6 +17,7 @@ const {
     removeSocket,
     getContactIds,
     onlineUserIds,
+    allOnlineUserIds
 } = require('./presence');
 const broadcast = require('./broadcast');
 
@@ -69,11 +70,22 @@ async function initSocket(httpServer) {
     // Per-connection setup
     io.on('connection', async (socket) => {
         const me = socket.data.user;
+
+        if (!me || !me.id) {
+            logger.error(
+                `Socket connected without auth: socket=${socket.id} data=${JSON.stringify(socket.data)}`
+            );
+            socket.disconnect(true);
+            return;
+        }
+
         logger.info(`Socket connected: ${socket.id} user=${me.id}`);
 
         // Join personal room (multi-device)
-        socket.join(`user:${me.id}`);
+        const userRoom = `user:${me.id}`;
+        socket.join(userRoom);
         socket.join('online');
+        logger.debug(`[presence] socket ${socket.id} joined room ${userRoom}`);
 
         // Register event handlers
         registerUserHandlers(io, socket);
@@ -86,14 +98,29 @@ async function initSocket(httpServer) {
             const justCameOnline = await addSocket(me.id, socket.id);
             broadcast.userConnected(me.id, socket.id);
 
+            // 1. Send the newly connected user the current online list FIRST,
+            //    so they know who's already online.
+            const currentOnline = onlineUserIds();
+            socket.emit('online:users', { userIds: currentOnline });
+            logger.debug(
+                `[presence] ${me.id} connected. Current online: [${currentOnline.join(', ')}]`
+            );
+
+            // 2. If this is the user's first socket (they just came online),
+            //    tell everyone else they've arrived.
             if (justCameOnline) {
-                const contactIds = await getContactIds(me.id);
-                broadcast.userStatus(contactIds, {
+                const recipients = allOnlineUserIds().filter((id) => id !== String(me.id));
+                logger.debug(
+                    `[presence] Broadcasting 'online' for ${me.id} to [${recipients.join(', ')}]`
+                );
+                broadcast.userStatus(recipients, {
                     userId: me.id,
                     status: 'online',
                     lastSeen: new Date(),
                 });
-                broadcast.onlineUsers(contactIds, onlineUserIds());
+                // Also send the fresh online list, so any client that was
+                // out-of-sync jumps to the correct state.
+                broadcast.onlineUsers(recipients, currentOnline);
             }
         } catch (err) {
             logger.error(`Presence on-connect error: ${err.message}`);
@@ -105,13 +132,13 @@ async function initSocket(httpServer) {
             try {
                 const wentOffline = await removeSocket(me.id, socket.id);
                 if (wentOffline) {
-                    const contactIds = await getContactIds(me.id);
-                    broadcast.userStatus(contactIds, {
+                    const recipients = allOnlineUserIds().filter((id) => id !== me.id);
+                    broadcast.userStatus(recipients, {
                         userId: me.id,
                         status: 'offline',
                         lastSeen: new Date(),
                     });
-                    broadcast.onlineUsers(contactIds, onlineUserIds());
+                    broadcast.onlineUsers(recipients, onlineUserIds());
                 }
             } catch (err) {
                 logger.error(`Presence on-disconnect error: ${err.message}`);

@@ -23,7 +23,7 @@ function isOnline(userId) {
 }
 
 function onlineUserIds() {
-    return Array.from(onlineSockets.keys());
+    return Array.from(onlineSockets.keys(). map(String));
 }
 
 /**
@@ -68,28 +68,30 @@ async function removeSocket(userId, socketId) {
         if (set.size === 0) onlineSockets.delete(key);
     }
 
+    // The in-memory map is the source of truth for "is this user still online".
+    // If any other socket exists for this user, they're still online.
+    const stillOnline = onlineSockets.has(key);
+
     let becameOffline = false;
     try {
         const user = await User.findById(userId);
         if (!user) return false;
 
-        const wasLastSocket =
-            (user.socketIds || []).length <= 1 ||
-            !user.socketIds.includes(socketId);
-
+        // Always resync the DB array to match reality
         user.socketIds = (user.socketIds || []).filter((id) => id !== socketId);
 
-        if (user.socketIds.length === 0) {
+        if (!stillOnline) {
+            // No in-memory sockets → definitely offline
             user.status = 'offline';
             user.lastSeen = new Date();
+            user.socketIds = []; // cleanup any stragglers
             becameOffline = true;
+        } else if (user.status === 'offline') {
+            // We still have sockets but status says offline → correct it
+            user.status = 'online';
         }
-        await user.save();
 
-        // If our in-memory cache says otherwise but DB says offline, trust DB
-        if (!onlineSockets.has(key) && !becameOffline && wasLastSocket) {
-            becameOffline = true;
-        }
+        await user.save();
     } catch (err) {
         logger.error(`Presence removeSocket DB error: ${err.message}`);
     }
@@ -138,9 +140,17 @@ async function getContactIds(userId) {
     return Array.from(ids);
 }
 
+/**
+ * Get the IDs of all users who are currently online.
+ */
+function allOnlineUserIds() {
+    return Array.from(onlineSockets.keys());
+}
+
 module.exports = {
     isOnline,
     onlineUserIds,
+    allOnlineUserIds,
     addSocket,
     removeSocket,
     setStatus,

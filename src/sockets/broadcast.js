@@ -32,7 +32,8 @@ function emitToUser(userIds, event, payload) {
     if (!ioRef) return;
     const ids = Array.isArray(userIds) ? userIds : [userIds];
     for (const id of ids) {
-        ioRef.to(`user:${id}`).emit(event, payload);
+        const str = String(id);
+        ioRef.to(`user:${str}`).emit(event, payload);
     }
 }
 
@@ -73,8 +74,12 @@ const broadcast = {
     },
 
     userStatus: (userIds, { userId, status, lastSeen, statusMessage }) => {
+        const logger = require('../config/logger');
+        logger.debug(
+            `[broadcast.userStatus] emitting to ${userIds.length} user(s) — user=${userId} status=${status}`
+        );
         emitToUser(userIds, SOCKET_EVENTS.USER_STATUS_CHANGED || 'user:status', {
-            userId,
+            userId: String(userId),
             status,
             lastSeen,
             statusMessage,
