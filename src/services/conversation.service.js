@@ -252,27 +252,65 @@ class ConversationService {
             );
         }
 
-        const conv = await Conversation.create({
+        // Reject if the creator already belongs to a group with this name.
+        // Reasoning: two groups with the same name are indistinguishable in the
+        // sidebar, so we enforce uniqueness per-user. Case-insensitive to catch
+        // "Project X" vs "project x".
+        const escapedName = name.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const existingWithName = await Conversation.findOne({
             type: CONVERSATION_TYPE.GROUP,
-            group: {
-                name: name.trim(),
-                description: (description || '').trim(),
-                avatar: avatar || { url: null, publicId: null },
-            },
-            participants: [
-                {
+            'group.name': { $regex: `^${escapedName}$`, $options: 'i' },
+            participants: {
+                $elemMatch: {
                     userId: new mongoose.Types.ObjectId(userIdStr),
-                    role: PARTICIPANT_ROLE.OWNER,
-                    joinedAt: new Date(),
+                    leftAt: null,
                 },
-                ...uniqueIds.map((id) => ({
-                    userId: new mongoose.Types.ObjectId(id),
-                    role: PARTICIPANT_ROLE.MEMBER,
-                    joinedAt: new Date(),
-                })),
-            ],
-            createdBy: new mongoose.Types.ObjectId(userIdStr),
-        });
+            },
+        })
+            .select('_id group.name')
+            .lean();
+
+        if (existingWithName) {
+            throw new ConflictError(
+                `You already have a group named "${name.trim()}". Please choose a different name.`,
+                'GROUP_NAME_TAKEN'
+            );
+        }
+
+        let conv;
+        try {
+            conv = await Conversation.create({
+                type: CONVERSATION_TYPE.GROUP,
+                group: {
+                    name: name.trim(),
+                    description: (description || '').trim(),
+                    avatar: avatar || { url: null, publicId: null },
+                },
+                participants: [
+                    {
+                        userId: new mongoose.Types.ObjectId(userIdStr),
+                        role: PARTICIPANT_ROLE.OWNER,
+                        joinedAt: new Date(),
+                    },
+                    ...uniqueIds.map((id) => ({
+                        userId: new mongoose.Types.ObjectId(id),
+                        role: PARTICIPANT_ROLE.MEMBER,
+                        joinedAt: new Date(),
+                    })),
+                ],
+                createdBy: new mongoose.Types.ObjectId(userIdStr),
+            });
+        } catch (err) {
+            // Catch any remaining duplicate-key error from a race condition
+            // and surface it as a friendly message.
+            if (err.code === 11000) {
+                throw new ConflictError(
+                    `A group named "${name.trim()}" with the same members already exists.`,
+                    'GROUP_ALREADY_EXISTS'
+                );
+            }
+            throw err;
+        }
 
         await conv.populate([
             {
@@ -281,14 +319,6 @@ class ConversationService {
             },
             { path: 'lastMessage.senderId', select: 'name username avatar' },
         ]);
-
-        const participantIds = conv.participants
-            .map((p) => (p.userId._id ? p.userId._id.toString() : p.userId.toString()));
-
-        broadcast.conversationNew({
-            participantIds,
-            conversation: serializeConversation(conv, userId),
-        });
 
         return {
             conversation: serializeConversation(conv, userId),

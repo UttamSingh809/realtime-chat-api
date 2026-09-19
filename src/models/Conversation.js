@@ -96,7 +96,6 @@ const ConversationSchema = new Schema(
         // Enforces single DM per user pair.
         privateKey: {
             type: String,
-            default: null,
             unique: true,
             sparse: true, // only indexed when set (i.e., private only)
         },
@@ -169,7 +168,7 @@ ConversationSchema.pre('validate', function (next) {
         if (!this.group || !this.group.name) {
             return next(new Error('Group conversations require a name'));
         }
-        this.privateKey = null;
+        this.privateKey = undefined;
     }
     next();
 });
