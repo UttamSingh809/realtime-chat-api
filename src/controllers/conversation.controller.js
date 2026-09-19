@@ -9,8 +9,14 @@ const asyncHandler = require('../utils/helpers/asyncHandler');
 
 const ConversationController = {
     create: asyncHandler(async (req, res) => {
-        const conversation = await ConversationService.create(req.user.id, req.body);
-        res.status(201).json({ success: true, data: { conversation } });
+        const { conversation, created } = await ConversationService.create(
+            req.user.id,
+            req.body
+        );
+        res.status(201).json({
+            success: true,
+            data: { conversation, created },
+        });
     }),
 
     list: asyncHandler(async (req, res) => {

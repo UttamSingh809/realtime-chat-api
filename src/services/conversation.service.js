@@ -158,13 +158,31 @@ class ConversationService {
         // Try to find existing DM
         const existing = await Conversation.findPrivate(userId, recipientId);
         if (existing) {
-            // If the DM was "deleted for me", restore it for me on new creation attempt
+            // Restore the DM for the caller if it was:
+            //   - deleted-for-me (soft-deleted by them)
+            //   - archived (moved to the archive folder)
+            //
+            // Rationale: the caller is explicitly opening this DM from the "+"
+            // modal, which is a strong "I want this back" signal. Matches
+            // WhatsApp/Telegram behavior. Sidebar clicks from the Archived tab
+            // do NOT trigger this path (they use GET /conversations/:id).
             const meParticipant = existing.getParticipant(userId);
-            if (meParticipant && meParticipant.deleted) {
-                meParticipant.deleted = false;
-                meParticipant.deletedAt = null;
-                meParticipant.unreadCount = 0;
-                await existing.save();
+            let restored = false;
+
+            if (meParticipant) {
+                if (meParticipant.deleted) {
+                    meParticipant.deleted = false;
+                    meParticipant.deletedAt = null;
+                    meParticipant.unreadCount = 0;
+                    restored = true;
+                }
+                if (meParticipant.archived) {
+                    meParticipant.archived = false;
+                    restored = true;
+                }
+                if (restored) {
+                    await existing.save();
+                }
             }
             await existing.populate([
                 {
@@ -173,7 +191,10 @@ class ConversationService {
                 },
                 { path: 'lastMessage.senderId', select: 'name username avatar' },
             ]);
-            return serializeConversation(existing, userId);
+            return {
+                conversation: serializeConversation(existing, userId),
+                created: false,
+            };
         }
 
         // Create new
@@ -202,7 +223,10 @@ class ConversationService {
             conversation: serializeConversation(conv, userId),
         });
 
-        return serializeConversation(conv, userId);
+        return {
+            conversation: serializeConversation(conv, userId),
+            created: true,
+        };
     }
 
     static async _createGroup(userId, { name, description, participants, avatar }) {
@@ -266,7 +290,10 @@ class ConversationService {
             conversation: serializeConversation(conv, userId),
         });
 
-        return serializeConversation(conv, userId);
+        return {
+            conversation: serializeConversation(conv, userId),
+            created: true,
+        };
     }
 
     // -----------------------------------------------------------------------
