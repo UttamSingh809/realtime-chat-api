@@ -590,18 +590,34 @@ class ConversationService {
             throw new ForbiddenError('You are not a participant', 'NOT_PARTICIPANT');
         }
 
-        me.unreadCount = 0;
-        me.lastReadAt = new Date();
-        if (upToMessageId) {
-            assertValidId(upToMessageId, 'Message');
-            me.lastReadMessageId = new mongoose.Types.ObjectId(upToMessageId);
+        const lastReadAt = new Date();
+        const lastReadMessageId = upToMessageId
+            ? new mongoose.Types.ObjectId(upToMessageId)
+            : null;
+
+        // Use updateOne with arrayFilters to avoid triggering Mongoose's
+        // `updatedAt` bump. Reading a conversation should NOT reorder the sidebar.
+        const setFields = {
+            'participants.$[p].unreadCount': 0,
+            'participants.$[p].lastReadAt': lastReadAt,
+        };
+        if (lastReadMessageId) {
+            setFields['participants.$[p].lastReadMessageId'] = lastReadMessageId;
         }
-        await conv.save();
+
+        await Conversation.updateOne(
+            { _id: conversationId },
+            { $set: setFields },
+            {
+                arrayFilters: [{ 'p.userId': new mongoose.Types.ObjectId(userId.toString()) }],
+                timestamps: false, // ← critical: do not update `updatedAt`
+            }
+        );
 
         return {
             unreadCount: 0,
-            lastReadAt: me.lastReadAt,
-            lastReadMessageId: me.lastReadMessageId,
+            lastReadAt,
+            lastReadMessageId,
         };
     }
 
@@ -615,21 +631,37 @@ class ConversationService {
             throw new ForbiddenError('You are not a participant', 'NOT_PARTICIPANT');
         }
 
-        for (const [key, value] of Object.entries(updates)) {
-            me[key] = value;
-        }
-
-        if (
+        // Restore from "deleted for me" if the user re-engages
+        const shouldUndelete =
             me.deleted &&
-            Object.keys(updates).some((k) => k === 'pinned' || k === 'archived' || k === 'muted')
-        ) {
-            me.deleted = false;
-            me.deletedAt = null;
+            Object.keys(updates).some((k) => k === 'pinned' || k === 'archived' || k === 'muted');
+
+        const setFields = {};
+        for (const [key, value] of Object.entries(updates)) {
+            setFields[`participants.$[p].${key}`] = value;
+        }
+        if (shouldUndelete) {
+            setFields['participants.$[p].deleted'] = false;
+            setFields['participants.$[p].deletedAt'] = null;
         }
 
-        await conv.save();
-        await conv.populate('participants.userId', 'name username avatar status lastSeen settings');
-        return serializeConversation(conv, userId);
+        // Use updateOne + timestamps: false — flag changes must not reorder.
+        await Conversation.updateOne(
+            { _id: conversationId },
+            { $set: setFields },
+            {
+                arrayFilters: [{ 'p.userId': new mongoose.Types.ObjectId(userId.toString()) }],
+                timestamps: false,
+            }
+        );
+
+        // Reload for the return value
+        const fresh = await Conversation.findById(conversationId).populate(
+            'participants.userId',
+            'name username avatar status lastSeen settings'
+        );
+
+        return serializeConversation(fresh, userId);
     }
 
     // -----------------------------------------------------------------------
