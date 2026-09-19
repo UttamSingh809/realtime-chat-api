@@ -171,12 +171,10 @@ MessageSchema.index(
 
 // Exclude messages deleted-for-everyone and messages deleted for the requesting user.
 // Callers can bypass via `.setOptions({ includeDeleted: true })`.
-MessageSchema.pre(/^find/, function (next) {
-    if (!this.getOptions().includeDeleted) {
-        this.where({ deletedForEveryone: { $ne: true } });
-    }
-    next();
-});
+// NOTE: No global pre-find filter here. Deleted-for-everyone messages must
+// be returned as tombstones so the UI can render "This message was deleted"
+// persistently. Filtering is done explicitly in the service layer where
+// needed (e.g., search).
 
 // ---------------------------------------------------------------------------
 // Virtuals

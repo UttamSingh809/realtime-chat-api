@@ -20,10 +20,12 @@ function refId(value) {
 /**
  * A message is "visible" to a user if it hasn't been deleted-for-everyone
  * and the user isn't in the deletedFor list.
+ * Note: messages deleted for everyone ARE visible (as tombstones) — the
+ * `isDeleted` flag tells the UI to render "This message was deleted". Only
+ * messages the viewer deleted for themselves are hidden entirely.
  */
 function isVisibleTo(message, userId) {
     if (!message) return false;
-    if (message.deletedForEveryone) return false;
     if (!userId) return true;
     const idStr = userId.toString();
     return !(message.deletedFor || []).some(

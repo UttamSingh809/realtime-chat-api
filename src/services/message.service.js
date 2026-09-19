@@ -320,7 +320,9 @@ class MessageService {
 
         const query = {
             conversationId,
-            deletedForEveryone: { $ne: true },
+            // Return tombstoned messages (deletedForEveryone: true) — the UI
+            // renders them as "This message was deleted". Only exclude messages
+            // the viewer deleted for themselves.
             deletedFor: { $ne: viewerId },
         };
 
