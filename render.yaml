@@ -1,3 +1,14 @@
+services:
+  - type: web
+    name: realtime-chat-api
+    env: node
+    region: oregon
+    plan: starter
+    branch: main
+    buildCommand: npm ci --only=production
+    startCommand: node src/server.js
+    healthCheckPath: /api/health
+    autoDeploy: true
     envVars:
       - key: NODE_ENV
         value: production
