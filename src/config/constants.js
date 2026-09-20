@@ -87,6 +87,7 @@ module.exports = {
         MESSAGE_EDIT: 'message:edit',
         MESSAGE_DELETE: 'message:delete',
         MESSAGE_READ: 'message:read',
+        MESSAGE_DELIVERED: 'message:delivered',
         MESSAGE_REACTION: 'message:reaction',
         TYPING_START: 'typing:start',
         TYPING_STOP: 'typing:stop',

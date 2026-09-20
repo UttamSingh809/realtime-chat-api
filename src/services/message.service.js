@@ -275,9 +275,19 @@ class MessageService {
         const already = (message.deliveredTo || []).some(
             (d) => refId(d.userId).toString() === userId.toString()
         );
+
         if (!already) {
             message.deliveredTo.push({ userId, deliveredAt: new Date() });
             await message.save();
+
+            // Broadcast so the sender's UI flips the tick from yellow to orange
+            // without waiting for a refresh.
+            broadcast.messageDelivered({
+                conversationId: message.conversationId.toString(),
+                messageId: message._id.toString(),
+                userId: userId.toString(),
+                deliveredAt: message.deliveredTo[message.deliveredTo.length - 1].deliveredAt,
+            });
         }
 
         return { delivered: true, alreadyDelivered: already };

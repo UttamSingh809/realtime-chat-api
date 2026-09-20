@@ -625,8 +625,11 @@ class ConversationService {
             ? new mongoose.Types.ObjectId(upToMessageId)
             : null;
 
-        // Use updateOne with arrayFilters to avoid triggering Mongoose's
-        // `updatedAt` bump. Reading a conversation should NOT reorder the sidebar.
+        // ---------------------------------------------------------------------
+        // 1. Update the caller's participant flags on the conversation.
+        //    Use updateOne + timestamps:false so this doesn't reorder the
+        //    sidebar (order is driven by lastMessage.createdAt).
+        // ---------------------------------------------------------------------
         const setFields = {
             'participants.$[p].unreadCount': 0,
             'participants.$[p].lastReadAt': lastReadAt,
@@ -639,11 +642,57 @@ class ConversationService {
             { _id: conversationId },
             { $set: setFields },
             {
-                arrayFilters: [{ 'p.userId': new mongoose.Types.ObjectId(userId.toString()) }],
-                timestamps: false, // ← critical: do not update `updatedAt`
+                arrayFilters: [
+                    { 'p.userId': new mongoose.Types.ObjectId(userId.toString()) },
+                ],
+                timestamps: false,
             }
         );
 
+        // ---------------------------------------------------------------------
+        // 2. Mark messages as read by this user.
+        //
+        //    This is what drives the sender's read receipts. We add the user
+        //    to readBy[] on every message they haven't already read.
+        //
+        //    Constraints:
+        //      - Only messages in this conversation
+        //      - Only messages NOT sent by the caller (you can't "read" your
+        //        own message — you always have, and it's already counted)
+        //      - Only messages up to upToMessageId (if provided)
+        //      - Skip messages already containing the user in readBy (idempotent)
+        // ---------------------------------------------------------------------
+        const { Message } = require('../models');
+
+        const messageFilter = {
+            conversationId,
+            senderId: { $ne: new mongoose.Types.ObjectId(userId.toString()) },
+            'readBy.userId': { $ne: new mongoose.Types.ObjectId(userId.toString()) },
+        };
+
+        if (lastReadMessageId) {
+            messageFilter._id = { $lte: lastReadMessageId };
+        }
+
+        await Message.updateMany(messageFilter, {
+            $push: { readBy: { userId, readAt: lastReadAt } },
+        });
+        // Notify all participants that this user has read up to a message.
+        // The sender's UI uses this to flip the read tick in real time.
+        const { broadcast } = require('../sockets');
+        if (broadcast) {
+            broadcast.messageRead({
+                conversationId: conversationId.toString(),
+                userId: userId.toString(),
+                upToMessageId: lastReadMessageId ? lastReadMessageId.toString() : null,
+                readAt: lastReadAt,
+            });
+        }
+        // ---------------------------------------------------------------------
+        // 3. Return the same shape as before so nothing downstream breaks.
+        //    The socket broadcast is fired by the controller, not here, so
+        //    we don't duplicate it.
+        // ---------------------------------------------------------------------
         return {
             unreadCount: 0,
             lastReadAt,

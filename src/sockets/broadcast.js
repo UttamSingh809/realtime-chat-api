@@ -136,6 +136,15 @@ const broadcast = {
         });
     },
 
+    messageDelivered: ({ conversationId, messageId, userId, deliveredAt }) => {
+        emitToConversation(conversationId, 'message:delivered', {
+            conversationId,
+            messageId,
+            userId,
+            deliveredAt,
+        });
+    },
+
     typingStart: ({ conversationId, userId }) => {
         emitToConversation(
             conversationId,
